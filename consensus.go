@@ -7,12 +7,6 @@ import (
 	"time"
 )
 
-type RpcCalls string 
-
-const (
-	REQUEST_VOTE = "ConsensusModule.RequestVote"
-)
-
 type LogEntry struct {
 	Command any
 	Term    int
@@ -60,8 +54,6 @@ func (c *ConsesusModule) Log(info... any) {
 // Behaviour
 //  Firstly we get the current term and the timeout in the cluster. The timeout is randomly selected between 150-300ms 
 //  We run checks against changes in state from Follower -> Candidate or vice versa, if there are changes then we stop the checks
-//
-//
 func (c *ConsesusModule) runElectionTimer() {
 	timeout := c.electionTimeout()
 	
@@ -151,7 +143,7 @@ func (c *ConsesusModule) startElection() {
 			var reply RequestVoteReply
 
 			// RPC request to peer requesting for vote
-			if c.server.Call(peerId, REQUEST_VOTE, args, reply) {
+			if c.server.Call(peerId, "ConsensusModule.RequestVote", args, reply) {
 				c.mu.Lock()
 				defer c.mu.Unlock()
 				c.Log("received RequestVoteReply, state = %v", c.state)
