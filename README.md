@@ -1,7 +1,4 @@
+# Resource
 
-
-
-## Resource
-
-1. [Why Consensus by Arpit Bhyani](https://arpitbhayani.me/blogs/why-consensus)
-2. 
+* [Why Consensus by Arpit Bhyani](https://arpitbhayani.me/blogs/why-consensus)
+* [Designing for Understandability](https://www.youtube.com/watch?v=vYp4LYbnnW8)
