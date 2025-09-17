@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -21,7 +22,7 @@ const (
 	DEAD
 )
 
-type ConsesusModule struct {
+type ConsensusModule struct {
 	// peer id of current node
 	id int
 
@@ -29,6 +30,9 @@ type ConsesusModule struct {
 	peerIDs []int
 
 	server *Server
+
+	// contains configuration values for peers
+	config *Config
 
 	// Persistent State on all server
 	currentTerm int
@@ -43,18 +47,18 @@ type ConsesusModule struct {
 	mu sync.Mutex
 }
 
-func (c *ConsesusModule) Log(info... any) {
+func (c *ConsensusModule) Log(info... any) {
 	log.Printf(
-		"RAFT - peer=[%s] - %v\n", info,
+		"RAFT - peer=[%s] - %v\n", c.id, info,
 	)
 }
 
-// runElectionTimer This allow the peer to timeout and perform any operation need (run an election or vote for another peer)
+// runElectionTimer This allow the peer to timeout and perform any operation maybe run an election or vote for another peer
 //
 // Behaviour
 //  Firstly we get the current term and the timeout in the cluster. The timeout is randomly selected between 150-300ms 
 //  We run checks against changes in state from Follower -> Candidate or vice versa, if there are changes then we stop the checks
-func (c *ConsesusModule) runElectionTimer() {
+func (c *ConsensusModule) runElectionTimer() {
 	timeout := c.electionTimeout()
 	
 	// acquire lock to get current term
@@ -84,7 +88,8 @@ func (c *ConsesusModule) runElectionTimer() {
 			return
 		}
 
-		// check if the term as changed during election-timeout waiting
+		// check if the term as changed during election-timeout waiting, stop the election timeout
+		// if any change and move the next cluster's currentTerm
 		if currentTerm != c.currentTerm {
 			c.Log("in election timer term changed from %d to %d", currentTerm, c.currentTerm)
 			c.mu.Unlock() // release lock for other threads
@@ -94,8 +99,8 @@ func (c *ConsesusModule) runElectionTimer() {
 		// Start election if 
 		// 1. Peer has not heard from the leader
 		// 2. Peer has not voted for another peer in the cluster.
-		elaspsed := time.Since(c.electionResetEvent);
-		if elaspsed >= timeout {
+		elaspsedTime := time.Since(c.electionResetEvent);
+		if elaspsedTime >= timeout {
 			c.startElection()
 			c.mu.Unlock() // release lock after election
 			return
@@ -114,7 +119,9 @@ func (c *ConsesusModule) runElectionTimer() {
 //  4. Vote for yourself (because why not lol...😂)
 //  3. Send RequestVote RPC to peers in the cluster & Wait for replies
 //  4. Promote to Leader if peer get majority votes
-func (c *ConsesusModule) startElection() {
+// Note:
+//  Every RPC calls is a gorountine because they're blocking (can take time for execution)
+func (c *ConsensusModule) startElection() {
 	c.mu.Lock()
 	// 1. Switch to candidate
 	c.state = CANDIDATE
@@ -133,7 +140,7 @@ func (c *ConsesusModule) startElection() {
 
 	votesReceived := 1
 
-	// 4. request for vote from other peers
+	// 4. request for vote from all other peers
 	for _, peerId := range c.peerIDs {
 		go func (peerId int)  {
 			args := RequestVoteArgs{
@@ -143,7 +150,8 @@ func (c *ConsesusModule) startElection() {
 			var reply RequestVoteReply
 
 			// RPC request to peer requesting for vote
-			if c.server.Call(peerId, "ConsensusModule.RequestVote", args, reply) {
+			err := c.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply)
+			if err == nil {
 				c.mu.Lock()
 				defer c.mu.Unlock()
 				c.Log("received RequestVoteReply, state = %v", c.state)
@@ -178,7 +186,7 @@ func (c *ConsesusModule) startElection() {
 						votesReceived++
 						if c.hasMajority(votesReceived) {
 							c.Log("election won with %d votes", votesReceived)
-							c.startLeader() // elect requesting peer has leader
+							c.becomeLeader() // elect requesting peer has leader
 							return
 						}
 					}
@@ -188,13 +196,92 @@ func (c *ConsesusModule) startElection() {
 	}
 
 	// It is possible that for a term we don't have any leader meaning we did not have a 
-	// succesful election, we need to start a timeout again to ensure another election on
-	// another term starts.
+	// succesful election, we need to start a timeout again to ensure another election on another term starts.
+	// If we had a succesful election then it will just return and wouldn't start any election timer.
 	go c.runElectionTimer()
 }
 
-func (c *ConsesusModule) startLeader() {
+// becomeLeader
+//
+// Behaviour:
+//  1. Makes the peer a leader
+//  2. Begins to send heartbeats RPCs to follower peers
+//  3. It stops all processes if leadership is lost.
+//
+// Note:
+func (c *ConsensusModule) becomeLeader() {
+	// 1. elect peer as leader
+	c.state = LEADER
+	c.Log("becomes LEADER; on term=%d, log=%v", c.currentTerm, c.log)
 
+	// 2. spawn goroutine to send hearbeats to follower peers every 50 milliseconds 
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			// continuously send heartbeats messages to peers for every tick (tick = 50 milliseconds)
+			c.sendHeartbeat()
+			<-ticker.C
+
+			// acquire lock to check if peer is still a leader . 
+			c.mu.Lock()
+			//3. If peer is not a Leader terminate process.
+			if c.state != LEADER {
+				c.mu.Unlock()
+				return
+			}
+			c.mu.Unlock()
+		}
+	}()
+}
+
+// sendHeartbeat performs RPCs calls to follower peers
+//
+// Behaviour:
+//  maSends RPCs call `AppendEntries` to follower peers
+//
+// Note:
+// 	- Even though there might not be an entry the Raft algorithm we still send AppendEntry Rpc call
+func (c *ConsensusModule) sendHeartbeat() {
+	// 1. acquire lock to get current term
+	c.mu.Lock()
+	currentTerm := c.currentTerm
+	c.mu.Unlock()
+
+	// 2. For each peer send AppendEntries RPC 
+	for _, peerId := range c.peerIDs {
+		args := AppendEntriesArgs{
+			Term: currentTerm,
+			LeaderId: c.id,
+		}
+
+		// NOTE: We are wrapping every RPC call in a goroutine because we can have a flaky network and this would cause the request-response to block if run on the main thread
+		go func (peerId int)  {
+			var reply AppendEntriesReply
+			c.Log("sending RPC AppendEntries to peer-%d, term=%d --- args=%v", peerId, currentTerm, args)
+			err := c.server.Call(peerId, "ConsensusModule.AppendEntry", args, &reply)
+			if err != nil {
+				// TODO: continuously retry this particular peerr
+				// FORNOW: just do a return return
+				return
+			}
+
+			// NOTE: we acquired the lock after the RPC call not before or else it would block and reduce performance drastically
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			
+			// 3. Checkif the term from the replying peer is greater than the current term (it means this leader is no longer the leader and would need to become a follower)
+			if reply.Term > currentTerm {
+				c.Log("Leadership lost, peer is on an old term. peerTerm=%d, latestTerm=%d", currentTerm, reply.Term)
+
+				// 4. Update peer state to follower (it's obvious right 🫠)
+				c.becomeFollower(reply.Term)
+				return // this terminates the leader sending heartbeats
+			}
+		}(peerId)
+
+	}
 }
 
 
@@ -208,15 +295,27 @@ func (c *ConsesusModule) startLeader() {
 // 
 // Returns
 //  bool: has majority or does not 
-func (c *ConsesusModule) hasMajority(voteCount int) bool {
+func (c *ConsensusModule) hasMajority(voteCount int) bool {
 	return voteCount * 2 > len(c.peerIDs) + 1
 }
 
-func (c *ConsesusModule) becomeFollower(term int) {
+func (c *ConsensusModule) becomeFollower(term int) {
+	c.Log("becomes Follower on term=%d log=%v", term, c.log)
 	c.mu.Lock()
 	c.state = FOLLOWER
 	c.currentTerm = term
+	c.votedFor = -1 // reset voting state
+
+	// If it becomes a Follower either by
+	// 1. Loosing leadership, when the term for the current leader is stale compared to the cluster
+	// 2. When leader has not sent any heartbeat
+	c.electionResetEvent = time.Now()
+
 	c.mu.Unlock()
+
+	// start election timer.
+	// once a peer becomes a follower let it start anticipating to begin an election if it recieves no heartbeat from the leader
+	go c.runElectionTimer()
 }
 
 // The timeout bandwidth for which a peer can wait before it changes to a candidate or leader
@@ -226,6 +325,106 @@ func (c *ConsesusModule) becomeFollower(term int) {
 //
 // Return:
 //  It returns a duration object (time.Duration)
-func (c *ConsesusModule) electionTimeout() (t time.Duration) {
+func (c *ConsensusModule) electionTimeout() (t time.Duration) {
 	return time.Duration(150+rand.Intn(15)) * time.Millisecond
+}
+
+// RequestVote grants or denies a requesting peer its vote
+//
+// Behaviour:
+//   Grants or denies vote to the requesting peer
+//
+// Return
+//  error: every RPC handler must return an error
+func (c *ConsensusModule) RequestVote(req RequestVoteArgs, reply *RequestVoteReply) (err error) {
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 1. Checks if the peer is alive (its possible a peer is down), if it isn't just stop processing
+	if c.state == DEAD {
+		//NOTE: When a peer is dead we keep retrying
+		// FORNOW: Just send an error message.
+		err = fmt.Errorf("error peer-%d is dead", c.id)
+		return err
+	}
+
+	c.Log("RequestVote: %+v [currentTerm=%d, votedFor=%d]", req, c.currentTerm, c.votedFor)
+
+	// 2. Compare terms between peers
+	// if current term is out of date then just become a follower
+	if c.currentTerm < req.Term {
+		c.Log("peer-%d term is out of date", c.id)
+		c.becomeFollower(req.Term)
+	}
+
+	// 3. Check if peer is same and if peer has not voted or has voted for requesting peer (candidateID)
+
+	// prepare conditions for the if..else statement to read more like the white paper
+	sameTerm := c.currentTerm == req.Term 
+	hasNotVoted := c.votedFor == -1
+	hasVotedForReqPeer := c.votedFor == req.CandidateId
+
+	if sameTerm && (hasNotVoted || hasVotedForReqPeer) {
+		reply.VoteGranted = true // grant vote
+		c.votedFor = req.CandidateId // track peer voted for
+		c.electionResetEvent = time.Now() // set reset election timeout 
+	} else {
+		reply.VoteGranted = false // deny vote
+	}
+
+	// 4. if vote is granted or denied respond to the requesting peer with the current term.
+	reply.Term = c.currentTerm
+	c.Log("RequestVote reply = %+v", reply)
+
+	return err
+}
+
+// AppendEntries it is used to
+//  1. Append entries from leaders to followers
+//  2. Send heartbeats messages from leaders
+//
+// Behaviour:
+//
+// Returns:
+// 	- Error
+func (c *ConsensusModule) AppendEntries(req AppendEntriesArgs, reply *AppendEntriesReply) (err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 1. Check the peer is alive
+	if c.state == DEAD {
+		return err
+	}
+
+	c.Log("AppendEntries: %+v", req.Entries)
+
+	// 2. Check if the term is outdate
+	if c.currentTerm < req.Term {
+		c.Log("... term out of date in AppendEntries")
+
+		// make peer a follower
+		c.becomeFollower(req.Term)
+	}
+
+	reply.Successs = false
+
+	// 4. Check if they're on the same term
+	if req.Term == c.currentTerm {
+		// 5. Check if the state of peer is a follower if not then make it a follower
+		// NOTE: This happens when the current peer is performing an election and another peer has already won the election and is already sending heartbeats to the followers.
+		if c.state != FOLLOWER {
+			c.becomeFollower(req.Term) // downgrade peer to Follower from Candidate
+		}
+		c.electionResetEvent = time.Now()
+
+		// Mark the operation as succesful
+		reply.Successs = true
+	}
+
+	// Reply with current peer's term is operation was succesful or not
+	reply.Term = c.currentTerm
+	c.Log("AppendEntries reply = %+v", *reply)
+
+
+	return err
 }

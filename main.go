@@ -1,8 +1,10 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+)
 
 
-func main() {
+func main() {	
 	fmt.Printf("understanding concensus in Go 🚀\n")
 }
